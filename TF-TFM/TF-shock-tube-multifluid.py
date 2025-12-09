@@ -15,11 +15,11 @@ def solve_multigas_shock_tube():
     n_steps = int(T_final / dt)
 
     # Relaxation constants
-    # tau_D = 5e-6          # s (Given in prompt)
-    # tau_T = 5e-6          # s (Given in prompt)
+    tau_D = 5e-6          # s (Given in prompt)
+    tau_T = 5e-6          # s (Given in prompt)
 
-    tau_D = 1e-4          # supposed to use 1e-3 s, but the solver blows up
-    tau_T = 1e-4          # supposed to use 1e-3 s, but the solver blows up
+    # tau_D = 1e-4          # supposed to use 1e-3 s, but the solver blows up
+    # tau_T = 1e-4          # supposed to use 1e-3 s, but the solver blows up
 
     # Gas Properties
     Cv1 = 13550.0
@@ -254,6 +254,7 @@ def solve_multigas_shock_tube():
     plt.subplot(2, 2, 1)
     plt.plot(x_c, p1/1e6, 'b-', label='P1 (Gas 1)')
     plt.plot(x_c, p2/1e6, 'r--', label='P2 (Gas 2)')
+    plt.plot(x_c, (p1+p2)/1e6, 'g:', label='P (Total)')
     plt.title('Partial Pressures (MPa)')
     plt.xlabel('x (m)')
     plt.legend()

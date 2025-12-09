@@ -13,12 +13,12 @@ def solve_updated_multiphase_shock_tube():
     dt = 1e-6
     n_steps = int(T_final / dt)
 
-    # Relaxation times
-    tau_D = 5e-6
-    tau_T = 5e-6
+    # # Relaxation times
+    # tau_D = 5e-6
+    # tau_T = 5e-6
 
-    #tau_D = 1e-3
-    #tau_T = 1e-3
+    tau_D = 1e-3
+    tau_T = 1e-3
 
     # Phase 1 (Gas/High Pressure)
     Cv1 = 13550.0
@@ -105,11 +105,18 @@ def solve_updated_multiphase_shock_tube():
 
         # Determine Dv, De at Cell Centers (Updated Definition)
         # Using macroscopic densities m1, m2
-        denom_D = (m1 + m2) * tau_D
-        Dv_c = (m1 * m2) / (denom_D + 1e-20)
+        # denom_D = (m1 + m2) * tau_D
+        # Dv_c = (m1 * m2) / (denom_D + 1e-20)
 
-        denom_T = (m1 * Cv1 + m2 * Cv2) * tau_T
-        De_c = (m1 * Cv1 * m2 * Cv2) / (denom_T + 1e-20)
+        # denom_T = (m1 * Cv1 + m2 * Cv2) * tau_T
+        # De_c = (m1 * Cv1 * m2 * Cv2) / (denom_T + 1e-20)
+
+        denom_D = (alpha1*rho1 + alpha2*rho2) * tau_D
+        Dv_c = (alpha1*rho1 * alpha2*rho2) / (denom_D + EPS)
+
+        denom_T = (alpha1*rho1 * Cv1 + alpha2*rho2 * Cv2) * tau_T
+        De_c = (alpha1*rho1 * Cv1 * alpha2*rho2 * Cv2) / (denom_T + EPS)
+
 
         # Interpolate velocities to centers for source terms
         u1_c = 0.5 * (u1[:-1] + u1[1:])
