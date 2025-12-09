@@ -105,6 +105,22 @@ class FullPressureTwoFluidSolver:
         Q_L[-1] = Q[-1]
         return Q_L
 
+    def reconstruct_QUICK(self, Q):
+        """
+        Quadratic Upwind Interpolation (QUICK) assuming predominantly positive flow.
+        Falls back to 1st order near boundaries or if velocity reverses.
+        """
+        Q_face = np.zeros(self.N + 1)
+        # Positive-flow-biased stencil: face i between cells i-1 and i
+        for i in range(1, self.N):
+            if i < 3:
+                Q_face[i] = Q[i-1]  # fallback near inlet
+            else:
+                Q_face[i] = (3*Q[i-1] + 6*Q[i-2] - Q[i-3]) / 8.0
+        Q_face[0] = Q[0]
+        Q_face[-1] = Q[-1]
+        return Q_face
+
     def solve(self, scheme='Upwind1'):
         # Reset State
         self.alpha = np.ones(self.N) * self.alpha0
@@ -140,6 +156,9 @@ class FullPressureTwoFluidSolver:
             if 'MUSCL' in scheme:
                 rho_muscl = self.reconstruct_MUSCL((1-self.alpha)*self.rho_l)
                 u_muscl   = self.reconstruct_MUSCL(self.u_l)
+            if 'QUICK' in scheme:
+                rho_quick = self.reconstruct_QUICK((1-self.alpha)*self.rho_l)
+                u_quick   = self.reconstruct_QUICK(self.u_l)
 
             for i in range(1, self.N):
                 # Basic Neighbors
@@ -162,6 +181,10 @@ class FullPressureTwoFluidSolver:
                     # Use the limited reconstructed values
                     rho_face = rho_muscl[i]
                     u_face   = u_muscl[i]
+
+                elif 'QUICK' in scheme:
+                    rho_face = rho_quick[i]
+                    u_face   = u_quick[i]
 
                 # Convective Flux
                 f_mass_conv = rho_face * u_face
@@ -235,6 +258,9 @@ results['Cen_EVM'] = solver.solve(scheme='Central_EVM')
 print("5. Running MUSCL + EVM...")
 results['MUSCL_EVM'] = solver.solve(scheme='MUSCL_EVM')
 
+print("6. Running QUICK (3rd order upwind, no EVM)...")
+results['QUICK'] = solver.solve(scheme='QUICK')
+
 # --- PLOTTING ---
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 
@@ -248,6 +274,7 @@ ax1.plot(solver.x, results['Up1'][1], 'g--', label='1st Order Upwind')
 
 # MUSCL (Standard)
 ax1.plot(solver.x, results['MUSCL'][1], 'y-', label='MUSCL (Van Leer)')
+ax1.plot(solver.x, results['QUICK'][1], 'k-', linewidth=2, label='QUICK')
 
 # EVM Stabilized
 #ax1.plot(solver.x, results['Cen_EVM'][1], 'b-', linewidth=2, label='Central + EVM')
