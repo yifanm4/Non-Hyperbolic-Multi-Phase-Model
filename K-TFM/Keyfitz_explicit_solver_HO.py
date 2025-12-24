@@ -107,6 +107,14 @@ def compute_entropy_viscosity(beta, F_beta, dx, max_vel):
     nu = np.minimum(nu_max, nu_E)
     return nu
 
+def path_jump_G(bL, oL, bR, oR, rho_g, rho_l):
+    """
+    Placeholder path-integral jump for nonconservative parts.
+    For this model the governing equations are handled as conservative+source,
+    so we return zeros; kept for extensibility to true path terms.
+    """
+    return np.zeros(2)
+
 # ==========================================
 #            MAIN SOLVER CLASS
 # ==========================================
@@ -163,6 +171,10 @@ class MultiSolver:
                 self.step_muscl(dt, use_harten=False)
             elif method == "2nd_Upwind_Harten":
                 self.step_muscl(dt, use_harten=True)
+            elif method == "Central_Upwind":
+                self.step_central_upwind(dt, use_path=False)
+            elif method == "Path_Central_Upwind":
+                self.step_central_upwind(dt, use_path=True, kappa=1.0)
 
         start, end = self.nghost, self.nghost + self.ncells
         ag, _, _, _ = primitives_from_conservatives(
@@ -300,6 +312,39 @@ class MultiSolver:
 
         self.update(dt, F_faces, slice(self.nghost, self.nghost+self.ncells))
 
+    # --- 6. Central-Upwind (Kurganov-type) ---
+    def cu_face_flux(self, bL, oL, bR, oR, use_path=False, kappa=1.0):
+        UL = np.array([bL, oL])
+        UR = np.array([bR, oR])
+
+        FL, _ = get_flux_and_source(bL, oL, self.rhog, self.rhol, self.U_mix, self.g)
+        FR, _ = get_flux_and_source(bR, oR, self.rhog, self.rhol, self.U_mix, self.g)
+
+        lam_L = characteristic_speed(bL, oL, self.rhog, self.rhol, self.U_mix)
+        lam_R = characteristic_speed(bR, oR, self.rhog, self.rhol, self.U_mix)
+        a = max(lam_L, lam_R)
+        a_plus = a
+        a_minus = -a
+        denom = a_plus - a_minus + 1e-12
+
+        H = (a_plus * FL + a_minus * FR) / denom + (a_plus * a_minus) / denom * (UR - UL)
+
+        if use_path:
+            G = path_jump_G(bL, oL, bR, oR, self.rhog, self.rhol)
+            H = H - kappa * (a_plus * a_minus) / denom * G
+        return H
+
+    def step_central_upwind(self, dt, use_path=False, kappa=1.0):
+        idx = slice(self.nghost, self.nghost + self.ncells)
+        F_faces = np.zeros((2, self.nx_tot))
+
+        for i in range(self.nghost, self.ncells + self.nghost + 1):
+            bL, oL = self.beta[i-1], self.omega[i-1]
+            bR, oR = self.beta[i],   self.omega[i]
+            F_faces[:, i] = self.cu_face_flux(bL, oL, bR, oR, use_path=use_path, kappa=kappa)
+
+        self.update(dt, F_faces, idx)
+
     def update(self, dt, F_faces, idx):
         # Helper to apply flux diff + source
         F_R = F_faces[:, self.nghost+1 : self.ncells + self.nghost + 1]
@@ -315,7 +360,7 @@ class MultiSolver:
 # ==========================================
 
 def main():
-    ncells = 200
+    ncells = 100
     tEnd = 0.5
     dt = 5e-5 # Small timestep for LxF stability
 
@@ -327,7 +372,9 @@ def main():
         "1st_Central_LxF",
         "1st_Central_EVM",
         "2nd_Upwind_VanLeer",
-        "2nd_Upwind_Harten"
+        "2nd_Upwind_Harten",
+        "Central_Upwind",
+        "Path_Central_Upwind"
     ]
 
     for s in solvers:
