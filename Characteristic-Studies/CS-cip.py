@@ -159,6 +159,7 @@ def plot_case_set(Ms2, r, title_suffix=""):
     plt.ylabel("G(Z)")
     plt.title(f"Characteristic function (outer view){title_suffix}")
     plt.legend()
+    plt.savefig("characteristic_function_Ms2_{Ms2:.3g}_r_{r:.3g}_outer.png")
     plt.show()
 
     # ---- Inner zoom (this is where the complex pair turns into real roots) ----
@@ -183,6 +184,7 @@ def plot_case_set(Ms2, r, title_suffix=""):
     plt.ylabel("G(Z)")
     plt.title(f"Characteristic function (inner zoom){title_suffix}")
     plt.legend()
+    plt.savefig("characteristic_function_Ms2_{Ms2:.3g}_r_{r:.3g}_inner.png")
     plt.show()
 
 

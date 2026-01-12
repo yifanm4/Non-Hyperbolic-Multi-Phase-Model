@@ -1,4 +1,5 @@
 import numpy as np
+import math
 import matplotlib.pyplot as plt
 
 class FullPressureTwoFluidSolver:
@@ -21,6 +22,86 @@ class FullPressureTwoFluidSolver:
 
         # History for Entropy Viscosity
         self.alpha_hist = [self.alpha.copy()] * 3
+
+    # ---------------------------------------------------------------------
+    # Nonconservative products (DLM / path-conservative interface terms)
+    # ---------------------------------------------------------------------
+    def nonconservative_matrix(self, U):
+        """
+        Return the nonconservative coefficient matrix B(U) for a term of the form
+            U_t + F(U)_x + B(U) U_x = S(U).
+        In the current faucet model we do NOT include any nonconservative products,
+        so the default is zero.
+
+        If you later add a nonconservative term (e.g., in a 1-pressure TFM with
+        interfacial-pressure / relaxation terms written as B(U)U_x), override this
+        function accordingly.
+
+        Parameters
+        ----------
+        U : array_like, shape (2,)
+            State vector [mass, mom].
+
+        Returns
+        -------
+        B : ndarray, shape (2,2)
+        """
+        return np.zeros((2, 2), dtype=float)
+
+    def _path_integral_BdU(self, U_L, U_R, n_quad=2):
+        """
+        Compute the DLM path integral
+            D(U_L,U_R) = ∫_0^1 B(φ(s)) φ_s(s) ds
+        along a straight-line path φ(s) = U_L + s (U_R-U_L).
+
+        Notes
+        -----
+        - For n_quad=2, we use 2-pt Gauss–Legendre on [0,1].
+        - If B(U)=0 (default), D=0 and the method reduces to the conservative CU/HLL form.
+        """
+        dU = U_R - U_L
+        if n_quad == 1:
+            s_nodes = [0.5]
+            w_nodes = [1.0]
+        elif n_quad == 2:
+            a = 1.0 / math.sqrt(3.0)
+            s_nodes = [0.5 * (1.0 - a), 0.5 * (1.0 + a)]
+            w_nodes = [0.5, 0.5]
+        else:
+            s_nodes = [(k + 0.5) / n_quad for k in range(n_quad)]
+            w_nodes = [1.0 / n_quad] * n_quad
+
+        D = np.zeros_like(dU, dtype=float)
+        for s, w in zip(s_nodes, w_nodes):
+            U = U_L + s * dU
+            B = self.nonconservative_matrix(U)
+            D += w * (B @ dU)
+        return D
+
+    def _pcu_fluctuations(self, U_L, U_R, F_L, F_R, a_minus, a_plus):
+        """
+        Compute path-conservative HLL-type fluctuations (M^- , M^+) satisfying:
+            M^- + M^+ = (F_R - F_L) + D(U_L,U_R),
+        where D is the DLM path integral for nonconservative products.
+
+        Returns
+        -------
+        M_minus, M_plus : ndarrays shape (2,)
+            Left-going and right-going fluctuations at the interface.
+        """
+        dU = U_R - U_L
+        D = self._path_integral_BdU(U_L, U_R)
+        C = (F_R - F_L) + D  # total jump consistent with the chosen path
+
+        if a_minus >= 0.0:
+            return np.zeros_like(C), C
+        if a_plus <= 0.0:
+            return C, np.zeros_like(C)
+
+        denom = (a_plus - a_minus)
+        M_minus = (a_plus / denom) * (C - a_minus * dU)
+        M_plus  = (-a_minus / denom) * (C - a_plus  * dU)
+        return M_minus, M_plus
 
     def van_leer(self, r):
         # Van Leer Slope Limiter
@@ -45,14 +126,15 @@ class FullPressureTwoFluidSolver:
 
     def pp_limit_slopes_mass(self, mass, slope_mass, slope_mom, m_min=1e-10, m_max=None):
         """
-        Bound/positivity-preserving rescaling for piecewise-linear reconstructions.
+        Positivity/bound-preserving slope limiter for MUSCL-type reconstructions.
 
-        Ensures reconstructed interface values:
-            m^- = m - 0.5*slope,  m^+ = m + 0.5*slope
-        satisfy:  m_min <= m^-, m^+ <= m_max (if m_max is not None).
+        Ensures the reconstructed interface values
+            mass_i^- = mass_i - 0.5*slope_mass_i
+            mass_i^+ = mass_i + 0.5*slope_mass_i
+        satisfy:  m_min <= mass_i^-, mass_i^+ <= m_max  (when m_max is not None).
 
-        We rescale BOTH mass and momentum slopes by the SAME theta so face velocities
-        u = mom/mass do not blow up when mass is limited.
+        We rescale BOTH mass and momentum slopes by the SAME factor so that face velocities
+        mom/mass do not blow up when mass is limited.
         """
         if m_max is None:
             m_max = np.inf
@@ -72,7 +154,7 @@ class FullPressureTwoFluidSolver:
 
             theta = 1.0
 
-            # Lower bound
+            # Lower bound enforcement
             if m_minus < m_min:
                 denom = m - m_minus
                 if denom > 0:
@@ -82,7 +164,7 @@ class FullPressureTwoFluidSolver:
                 if denom > 0:
                     theta = min(theta, (m - m_min) / denom)
 
-            # Upper bound (keeps alpha in [0,1])
+            # Upper bound enforcement (optional, helps keep alpha in [0,1])
             if m_minus > m_max:
                 denom = m_minus - m
                 if denom > 0:
@@ -98,6 +180,28 @@ class FullPressureTwoFluidSolver:
 
         return sm, sp
 
+    def minmod(self, a, b):
+        """Componentwise minmod limiter."""
+        return 0.5 * (np.sign(a) + np.sign(b)) * np.minimum(np.abs(a), np.abs(b))
+
+    def _cu_semidiscrete_flux(self, U_minus, U_plus, F_minus, F_plus, a_minus, a_plus):
+        """
+        Semidiscrete central-upwind numerical flux with built-in anti-diffusion:
+            H = (a^+ f(U^-) - a^- f(U^+))/(a^+ - a^-) + (a^+ a^-)/(a^+ - a^-)(U^+ - U^-) - d/2
+        where
+            d = minmod( (U^+ - U*)/(a^+ - a^-), (U* - U^-)/(a^+ - a^-) )
+            U* = (a^+ U^+ - a^- U^- - (f(U^+) - f(U^-)))/(a^+ - a^-)
+        (See Handbook of Numerical Analysis, Chapter 20, Eqs. (46)-(49).)
+        """
+        denom = a_plus - a_minus
+        if denom < 1e-14:
+            # Degenerate case (no upwind direction); use centered flux
+            return 0.5 * (F_minus + F_plus)
+
+        U_star = (a_plus * U_plus - a_minus * U_minus - (F_plus - F_minus)) / denom
+        d = self.minmod((U_plus - U_star) / denom, (U_star - U_minus) / denom)
+        H = (a_plus * F_minus - a_minus * F_plus + a_plus * a_minus * (U_plus - U_minus)) / denom - 0.5 * d
+        return H
 
     def compute_entropy_viscosity(self, dt, v_field):
         # 1. Update History
@@ -293,7 +397,7 @@ class FullPressureTwoFluidSolver:
 
         t = 0.0
         CFL = 0.1
-        if any(tag in scheme for tag in ['ENO', 'WENO', 'CWENO', 'KU', 'PCU']):
+        if any(tag in scheme for tag in ['ENO', 'WENO', 'CWENO', 'KU', 'PCU', 'SDCU']):
             CFL = 0.05  # tighten timestep for high-order / central-upwind schemes
         visc_record = np.zeros(self.N + 1)
 
@@ -318,6 +422,17 @@ class FullPressureTwoFluidSolver:
             flux_mass = np.zeros(self.N + 1)
             flux_mom  = np.zeros(self.N + 1)
 
+            # Artificial-viscosity dissipation kept as a separate conservative flux.
+            flux_mass_diss = np.zeros(self.N + 1)
+            flux_mom_diss  = np.zeros(self.N + 1)
+
+            # Path-conservative fluctuations for the convective (hyperbolic) part.
+            if 'PCU' in scheme:
+                Mminus_mass = np.zeros(self.N + 1)
+                Mplus_mass  = np.zeros(self.N + 1)
+                Mminus_mom  = np.zeros(self.N + 1)
+                Mplus_mom   = np.zeros(self.N + 1)
+
             mass = (1 - self.alpha) * self.rho_l
             mom  = mass * self.u_l
 
@@ -328,10 +443,10 @@ class FullPressureTwoFluidSolver:
             if 'QUICK' in scheme:
                 rho_quick = self.reconstruct_QUICK(mass)
                 u_quick   = self.reconstruct_QUICK(self.u_l)
-            if ('NT' in scheme) or ('KU' in scheme) or ('PCU' in scheme):
+            if ('NT' in scheme) or ('KU' in scheme) or ('PCU' in scheme) or ('SDCU' in scheme):
                 slope_mass = self.limited_slope(mass)
                 slope_mom  = self.limited_slope(mom)
-                # Make reconstruction truly bound/positivity-preserving for mass
+                # Make the reconstruction truly bound/positivity-preserving for mass
                 slope_mass, slope_mom = self.pp_limit_slopes_mass(
                     mass, slope_mass, slope_mom,
                     m_min=1e-10,
@@ -348,7 +463,7 @@ class FullPressureTwoFluidSolver:
                 u_cweno   = self.reconstruct_CWENO3(self.u_l)
 
             # Add a small Rusanov-like baseline viscosity for high-order schemes to prevent blow-up
-            if any(tag in scheme for tag in ['ENO', 'WENO', 'CWENO', 'KU', 'PCU']):
+            if any(tag in scheme for tag in ['ENO', 'WENO', 'CWENO', 'KU', 'PCU', 'SDCU']):
                 face_speed = np.zeros(self.N + 1)
                 face_speed[1:-1] = 0.5 * (np.abs(self.u_l[:-1]) + np.abs(self.u_l[1:]))
                 face_speed[0] = np.abs(self.v0)
@@ -362,6 +477,11 @@ class FullPressureTwoFluidSolver:
                 rho_R = mass[i]
                 u_L = self.u_l[i-1]
                 u_R = self.u_l[i]
+                # Defaults (used by non-CU schemes and for diffusion term)
+                mass_L = rho_L
+                mass_R = rho_R
+                mom_L  = mom[i-1]
+                mom_R  = mom[i]
 
                 # --- FLUX SELECTION ---
 
@@ -395,59 +515,120 @@ class FullPressureTwoFluidSolver:
                     u_face   = u_weno[i]
 
                 elif 'KU' in scheme:
-                    # Kurganov central-upwind flux with limited slopes
+                    # Positivity-preserving central-upwind (Kurganov-type) flux
                     mass_L = mass[i-1] + 0.5 * slope_mass[i-1]
                     mass_R = mass[i]   - 0.5 * slope_mass[i]
                     mom_L  = mom[i-1]  + 0.5 * slope_mom[i-1]
                     mom_R  = mom[i]    - 0.5 * slope_mom[i]
 
-                    u_L_face = mom_L / mass_L if mass_L > 1e-8 else 0.0
-                    u_R_face = mom_R / mass_R if mass_R > 1e-8 else 0.0
+                    u_L_face = mom_L / mass_L
+                    u_R_face = mom_R / mass_R
 
-                    f_mass_L = mass_L * u_L_face
-                    f_mass_R = mass_R * u_R_face
-                    f_mom_L  = mom_L  * u_L_face
-                    f_mom_R  = mom_R  * u_R_face
+                    f_mass_L = mom_L
+                    f_mass_R = mom_R
+                    f_mom_L  = mom_L * u_L_face
+                    f_mom_R  = mom_R * u_R_face
 
-                    a_plus  = max(u_L_face, u_R_face, 0.0) + 1e-8
-                    a_minus = min(u_L_face, u_R_face, 0.0) - 1e-8
+                    a_plus  = max(u_L_face, u_R_face, 0.0)
+                    a_minus = min(u_L_face, u_R_face, 0.0)
                     denom = a_plus - a_minus
 
-                    f_mass_conv = (a_plus * f_mass_L - a_minus * f_mass_R + a_plus * a_minus * (mass_R - mass_L)) / denom
-                    f_mom_conv  = (a_plus * f_mom_L  - a_minus * f_mom_R  + a_plus * a_minus * (mom_R  - mom_L )) / denom
+                    if denom < 1e-14:
+                        # fallback to local Lax-Friedrichs at nearly-stationary interfaces
+                        s = max(abs(u_L_face), abs(u_R_face)) + 1e-14
+                        f_mass_conv = 0.5 * (f_mass_L + f_mass_R) - 0.5 * s * (mass_R - mass_L)
+                        f_mom_conv  = 0.5 * (f_mom_L  + f_mom_R ) - 0.5 * s * (mom_R  - mom_L )
+                    else:
+                        f_mass_conv = (a_plus * f_mass_L - a_minus * f_mass_R + a_plus * a_minus * (mass_R - mass_L)) / denom
+                        f_mom_conv  = (a_plus * f_mom_L  - a_minus * f_mom_R  + a_plus * a_minus * (mom_R  - mom_L )) / denom
+                elif 'SDCU' in scheme:
+                    # Semidiscrete central-upwind flux (Section 6.1) with built-in anti-diffusion.
+                    # See Handbook of Numerical Analysis, Chapter 20, Eqs. (46)-(49).
+                    mass_L = mass[i-1] + 0.5 * slope_mass[i-1]
+                    mass_R = mass[i]   - 0.5 * slope_mass[i]
+                    mom_L  = mom[i-1]  + 0.5 * slope_mom[i-1]
+                    mom_R  = mom[i]    - 0.5 * slope_mom[i]
+
+                    mass_L = max(mass_L, 1e-12)
+                    mass_R = max(mass_R, 1e-12)
+
+                    U_minus = np.array([mass_L, mom_L], dtype=float)
+                    U_plus  = np.array([mass_R, mom_R], dtype=float)
+
+                    u_minus = U_minus[1] / U_minus[0]
+                    u_plus  = U_plus[1]  / U_plus[0]
+
+                    F_minus = np.array([U_minus[1], U_minus[1] * u_minus], dtype=float)
+                    F_plus  = np.array([U_plus[1],  U_plus[1]  * u_plus ], dtype=float)
+
+                    a_plus  = max(u_minus, u_plus, 0.0)
+                    a_minus = min(u_minus, u_plus, 0.0)
+
+                    H = self._cu_semidiscrete_flux(U_minus, U_plus, F_minus, F_plus, a_minus, a_plus)
+                    f_mass_conv = H[0]
+                    f_mom_conv  = H[1]
 
                 elif 'PCU' in scheme:
-                    # Path-conservative central-upwind (uses same structure with path-averaged states)
+                    # Path-conservative central-upwind (HLL-type) convective update.
+                    #
+                    # If the PDE contains a nonconservative product B(U)U_x, the jump condition
+                    # across discontinuities involves a DLM path integral. We account for that
+                    # by computing fluctuations (M^- , M^+) that satisfy
+                    #   M^- + M^+ = (F_R - F_L) + ∫_0^1 B(φ(s)) φ_s ds,
+                    # and updating in fluctuation form (see Castro et al., 2008).
+                    #
+                    # In the current faucet model B=0 by default, so this reduces to the
+                    # standard conservative CU/HLL fluctuations.
+
+                    # Reconstructed interface states
                     mass_L = mass[i-1] + 0.5 * slope_mass[i-1]
                     mass_R = mass[i]   - 0.5 * slope_mass[i]
                     mom_L  = mom[i-1]  + 0.5 * slope_mom[i-1]
                     mom_R  = mom[i]    - 0.5 * slope_mom[i]
 
-                    # Path-average velocities (simple midpoint path)
-                    mass_bar = 0.5 * (mass_L + mass_R)
-                    u_L_face = mom_L / mass_L if mass_L > 1e-8 else 0.0
-                    u_R_face = mom_R / mass_R if mass_R > 1e-8 else 0.0
-                    u_bar = 0.5 * (u_L_face + u_R_face)
+                    # Enforce positivity of reconstructed mass
+                    mass_L = max(mass_L, 1e-12)
+                    mass_R = max(mass_R, 1e-12)
 
-                    f_mass_L = mass_L * u_L_face
-                    f_mass_R = mass_R * u_R_face
-                    f_mom_L  = mom_L  * u_L_face
-                    f_mom_R  = mom_R  * u_R_face
+                    u_L_face = mom_L / mass_L
+                    u_R_face = mom_R / mass_R
 
-                    a_plus  = max(u_L_face, u_R_face, u_bar, 0.0) + 1e-8
-                    a_minus = min(u_L_face, u_R_face, u_bar, 0.0) - 1e-8
+                    # Conservative fluxes at states
+                    F_L = np.array([mom_L, mom_L * u_L_face], dtype=float)
+                    F_R = np.array([mom_R, mom_R * u_R_face], dtype=float)
+                    U_Lv = np.array([mass_L, mom_L], dtype=float)
+                    U_Rv = np.array([mass_R, mom_R], dtype=float)
+
+                    a_plus  = max(u_L_face, u_R_face, 0.0)
+                    a_minus = min(u_L_face, u_R_face, 0.0)
+
+                    # DLM-consistent fluctuations for the convective part
+                    M_minus, M_plus = self._pcu_fluctuations(U_Lv, U_Rv, F_L, F_R, a_minus, a_plus)
+                    Mminus_mass[i] = M_minus[0]
+                    Mplus_mass[i]  = M_plus[0]
+                    Mminus_mom[i]  = M_minus[1]
+                    Mplus_mom[i]   = M_plus[1]
+
+                    # For compatibility (and plotting), also compute the conservative CU/HLL flux:
                     denom = a_plus - a_minus
-
-                    # Nonconservative path term vanishes for pure convective form; keep structure for extension
-                    f_mass_conv = (a_plus * f_mass_L - a_minus * f_mass_R + a_plus * a_minus * (mass_R - mass_L)) / denom
-                    f_mom_conv  = (a_plus * f_mom_L  - a_minus * f_mom_R  + a_plus * a_minus * (mom_R  - mom_L )) / denom
-
+                    if denom < 1e-14:
+                        s = max(abs(u_L_face), abs(u_R_face)) + 1e-14
+                        f_mass_conv = 0.5 * (F_L[0] + F_R[0]) - 0.5 * s * (mass_R - mass_L)
+                        f_mom_conv  = 0.5 * (F_L[1] + F_R[1]) - 0.5 * s * (mom_R  - mom_L )
+                    else:
+                        f_mass_conv = (a_plus * F_L[0] - a_minus * F_R[0] + a_plus * a_minus * (mass_R - mass_L)) / denom
+                        f_mom_conv  = (a_plus * F_L[1] - a_minus * F_R[1] + a_plus * a_minus * (mom_R  - mom_L )) / denom
                 elif 'NT' in scheme:
                     # Nessyahu-Tadmor 2nd-order central flux (Lax-Friedrichs form)
                     mass_minus = mass[i-1] + 0.5 * slope_mass[i-1]
                     mass_plus  = mass[i]   - 0.5 * slope_mass[i]
                     mom_minus  = mom[i-1]  + 0.5 * slope_mom[i-1]
                     mom_plus   = mom[i]    - 0.5 * slope_mom[i]
+                    # Use reconstructed states for the viscosity term as well
+                    mass_L = mass_minus
+                    mass_R = mass_plus
+                    mom_L  = mom_minus
+                    mom_R  = mom_plus
 
                     u_minus = mom_minus / mass_minus if mass_minus > 1e-8 else 0.0
                     u_plus  = mom_plus  / mass_plus  if mass_plus  > 1e-8 else 0.0
@@ -463,27 +644,98 @@ class FullPressureTwoFluidSolver:
                     f_mom_conv  = 0.5 * (f_mom_minus + f_mom_plus)   - 0.5 * a_face * (mom_plus - mom_minus)
 
                 # Convective Flux
-                if ('NT' not in scheme) and ('KU' not in scheme) and ('PCU' not in scheme):
+                if ('NT' not in scheme) and ('KU' not in scheme) and ('PCU' not in scheme) and ('SDCU' not in scheme):
                     f_mass_conv = rho_face * u_face
                     f_mom_conv  = rho_face * u_face**2
 
-                # --- ADD DIFFUSION (EVM) ---
-                grad_rho = (rho_R - rho_L) / self.dx
-                grad_mom = (mom[i] - mom[i-1]) / self.dx
+                # --- ADD DIFFUSION / ARTIFICIAL VISCOSITY (conservative form) ---
+                # Interpret nu_visc as a face diffusivity and write it as an additional
+                # Rusanov/Lax-Friedrichs dissipation term using the (possibly reconstructed) jump.
+                s_visc = 2.0 * nu_visc[i] / self.dx  # [m/s]
 
-                flux_mass[i] = f_mass_conv - nu_visc[i] * grad_rho
-                flux_mom[i]  = f_mom_conv  - nu_visc[i] * grad_mom
+                # Conservative artificial-viscosity (stored separately for PCU fluctuation update)
+                flux_mass_diss[i] = -0.5 * s_visc * (mass_R - mass_L)
+                flux_mom_diss[i]  = -0.5 * s_visc * (mom_R  - mom_L )
+
+                flux_mass[i] = f_mass_conv + flux_mass_diss[i]
+                flux_mom[i]  = f_mom_conv  + flux_mom_diss[i]
 
             # Boundary Fluxes
-            rho_in = (1.0 - self.alpha0)*self.rho_l
+            rho_in = (1.0 - self.alpha0) * self.rho_l
+
+            # Always set these for convenience (used by non-PCU schemes and plots)
             flux_mass[0] = rho_in * self.v0
             flux_mom[0]  = rho_in * self.v0**2
             flux_mass[-1] = flux_mass[-2]
             flux_mom[-1]  = flux_mom[-2]
 
+            # For PCU, we must also provide boundary fluctuations and dissipation fluxes.
+            if 'PCU' in scheme:
+                # Left boundary (inflow ghost -> cell 0)
+                mass_Rb = mass[0] - 0.5 * slope_mass[0]
+                mom_Rb  = mom[0]  - 0.5 * slope_mom[0]
+                mass_Rb = max(mass_Rb, 1e-12)
+
+                U_Lb = np.array([rho_in, rho_in * self.v0], dtype=float)
+                U_Rb = np.array([mass_Rb, mom_Rb], dtype=float)
+
+                u_Lb = U_Lb[1] / U_Lb[0]
+                u_Rb = U_Rb[1] / U_Rb[0]
+
+                F_Lb = np.array([U_Lb[1], U_Lb[1] * u_Lb], dtype=float)
+                F_Rb = np.array([U_Rb[1], U_Rb[1] * u_Rb], dtype=float)
+
+                a_plus  = max(u_Lb, u_Rb, 0.0)
+                a_minus = min(u_Lb, u_Rb, 0.0)
+
+                M_minus, M_plus = self._pcu_fluctuations(U_Lb, U_Rb, F_Lb, F_Rb, a_minus, a_plus)
+                Mminus_mass[0] = M_minus[0]
+                Mplus_mass[0]  = M_plus[0]
+                Mminus_mom[0]  = M_minus[1]
+                Mplus_mom[0]   = M_plus[1]
+
+                # Right boundary (outflow): copy last-cell state -> zero jump
+                mass_Lb = mass[-1] + 0.5 * slope_mass[-1]
+                mom_Lb  = mom[-1]  + 0.5 * slope_mom[-1]
+                mass_Lb = max(mass_Lb, 1e-12)
+
+                U_Lb = np.array([mass_Lb, mom_Lb], dtype=float)
+                U_Rb = U_Lb.copy()
+
+                u_b  = U_Lb[1] / U_Lb[0]
+                F_b  = np.array([U_Lb[1], U_Lb[1] * u_b], dtype=float)
+
+                a_plus  = max(u_b, 0.0)
+                a_minus = min(u_b, 0.0)
+
+                M_minus, M_plus = self._pcu_fluctuations(U_Lb, U_Rb, F_b, F_b, a_minus, a_plus)
+                Mminus_mass[self.N] = M_minus[0]
+                Mplus_mass[self.N]  = M_plus[0]
+                Mminus_mom[self.N]  = M_minus[1]
+                Mplus_mom[self.N]   = M_plus[1]
+
+                # Dissipation flux BCs (conservative)
+                flux_mass_diss[0]  = 0.0
+                flux_mom_diss[0]   = 0.0
+                flux_mass_diss[-1] = flux_mass_diss[-2]
+                flux_mom_diss[-1]  = flux_mom_diss[-2]
             # --- 4. Update Equations ---
-            div_mass = (flux_mass[1:] - flux_mass[:-1]) / self.dx
-            div_mom  = (flux_mom[1:] - flux_mom[:-1]) / self.dx
+            if 'PCU' in scheme:
+                # Path-conservative update in fluctuation form:
+                #   U_i^{n+1} = U_i^n - dt/dx ( M^+_{i-1/2} + M^-_{i+1/2} )
+                # (see Castro et al., 2008, Eq. (2.5)). The fluctuations are built so that
+                # M^- + M^+ matches the DLM path integral jump (Eq. (2.7)).
+                div_mass_conv = (Mplus_mass[0:self.N] + Mminus_mass[1:self.N+1]) / self.dx
+                div_mom_conv  = (Mplus_mom [0:self.N] + Mminus_mom [1:self.N+1]) / self.dx
+
+                div_mass_diss = (flux_mass_diss[1:] - flux_mass_diss[:-1]) / self.dx
+                div_mom_diss  = (flux_mom_diss [1:] - flux_mom_diss [: -1]) / self.dx
+
+                div_mass = div_mass_conv + div_mass_diss
+                div_mom  = div_mom_conv  + div_mom_diss
+            else:
+                div_mass = (flux_mass[1:] - flux_mass[:-1]) / self.dx
+                div_mom  = (flux_mom[1:] - flux_mom[:-1]) / self.dx
 
             force_grav = (1.0 - self.alpha) * self.rho_l * self.g
 
@@ -514,7 +766,7 @@ class FullPressureTwoFluidSolver:
         return self.x, alpha_exact
 
 # --- RUNNING THE CASES ---
-N_cells=2000
+N_cells=50
 solver = FullPressureTwoFluidSolver(n_cells=N_cells, t_final=0.5)
 
 x_ref, alpha_ref = solver.analytical_solution(0.5)
@@ -553,6 +805,10 @@ results['CWENO3'] = solver.solve(scheme='CWENO')
 print("11. Running Kurganov Central-Upwind...")
 results['KU'] = solver.solve(scheme='KU')
 
+print("11b. Running Semidiscrete Central-Upwind (Section 6.1, with anti-diffusion)...")
+results['SDCU'] = solver.solve(scheme='SDCU')
+
+
 print("12. Running Path-Conservative Central-Upwind...")
 results['PCU'] = solver.solve(scheme='PCU')
 
@@ -563,23 +819,40 @@ fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
 ax1.set_title("Water Faucet: Flux Scheme Comparison")
 ax1.plot(x_ref, alpha_ref, 'k--', linewidth=2, label='Analytical')
 
-# Baseline / Unstable
-ax1.plot(solver.x, results['Up1'][1], 'g--', label='1st Order Upwind')
-#ax1.plot(solver.x, results['Cen'][1], 'm:',  label='Central (Unstable)')
+label_map = {
+    'Up1': '1st Order Upwind',
+    'MUSCL': 'MUSCL (Van Leer)',
+    'Cen': 'Central',
+    'Cen_EVM': 'Central + EVM',
+    'MUSCL_EVM': 'MUSCL + EVM',
+    'QUICK': 'QUICK',
+    'NT': 'Nessyahu-Tadmor 2nd Order',
+    'ENO2': 'ENO-2',
+    'WENO3': 'WENO-3',
+    'CWENO3': 'CWENO-3',
+    'KU': 'Kurganov CU',
+    'SDCU': 'Semidiscrete CU (Sec 6.1)',
+    'PCU': 'Path-Cons. CU',
+}
+style_map = {
+    'Up1': {'linestyle': '--', 'color': 'g'},
+    'MUSCL': {'linestyle': '-', 'color': 'y'},
+    'Cen': {'linestyle': ':', 'color': 'm'},
+    'Cen_EVM': {'linestyle': '-', 'color': 'b'},
+    'MUSCL_EVM': {'linestyle': '-', 'color': 'r'},
+    'QUICK': {'linestyle': '-', 'color': 'k'},
+    'NT': {'linestyle': '--', 'color': 'blue'},
+    'ENO2': {'linestyle': '--', 'color': 'brown'},
+    'WENO3': {'linestyle': '-.', 'color': 'red'},
+    'CWENO3': {'linestyle': ':', 'color': 'orange'},
+    'KU': {'linestyle': '-', 'color': 'tab:purple'},
+    'SDCU': {'linestyle': '-', 'color': 'tab:orange'},
+    'PCU': {'linestyle': '-', 'color': 'tab:cyan'},
+}
 
-# # MUSCL (Standard)
-ax1.plot(solver.x, results['MUSCL'][1], 'y-', label='MUSCL (Van Leer)')
-# #ax1.plot(solver.x, results['QUICK'][1], 'k-', linewidth=1.5, label='QUICK')
-# ax1.plot(solver.x, results['NT'][1], color='blue',linestyle='--',linewidth=2, label='Nessyahu-Tadmor 2nd Order')
-ax1.plot(solver.x, results['KU'][1], color='tab:purple', linestyle='-', linewidth=2.0, label='Kurganov CU')
-ax1.plot(solver.x, results['PCU'][1], color='tab:cyan', linestyle=':', linewidth=2.0, label='Path-Cons. CU')
-# ax1.plot(solver.x, results['ENO2'][1], color='brown', linestyle='--', linewidth=2.0, label='ENO-2')
-# ax1.plot(solver.x, results['WENO3'][1], color='red', linestyle='-.', linewidth=2.0, label='WENO-3')
-# ax1.plot(solver.x, results['CWENO3'][1], color='orange', linestyle=':', linewidth=2.0, label='CWENO-3')
-
-# EVM Stabilized
-#ax1.plot(solver.x, results['Cen_EVM'][1], 'b-', linewidth=2, label='Central + EVM')
-ax1.plot(solver.x, results['MUSCL_EVM'][1], 'r-', linewidth=2, label='MUSCL + EVM')
+for key, (_, alpha_num, _) in results.items():
+    style = style_map.get(key, {})
+    ax1.plot(solver.x, alpha_num, linewidth=2.0, label=label_map.get(key, key), **style)
 
 ax1.set_xlabel("Position (m)")
 ax1.set_ylabel("Void Fraction")
@@ -599,5 +872,5 @@ ax2.legend()
 ax2.grid(True, alpha=0.3)
 
 plt.tight_layout()
-#plt.savefig(f'Water_Faucet_Flux_Scheme_Comparison_nCells_{N_cells}.png')
+plt.savefig(f'Water_Faucet_Flux_Scheme_Comparison_nCells_{N_cells}.png')
 plt.show()
