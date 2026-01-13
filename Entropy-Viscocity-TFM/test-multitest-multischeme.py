@@ -322,7 +322,7 @@ class FullPressureTwoFluidSolver:
             mom  = mass * self.u_l
 
             # Pre-calculate Reconstructions if needed
-            if 'MUSCL' in scheme:
+            if ('MUSCL' in scheme) or ('SDCU61' in scheme):
                 rho_muscl = self.reconstruct_MUSCL(mass)
                 u_muscl   = self.reconstruct_MUSCL(self.u_l)
             if 'QUICK' in scheme:
@@ -380,6 +380,11 @@ class FullPressureTwoFluidSolver:
 
                 elif 'MUSCL' in scheme:
                     # Use the limited reconstructed values
+                    rho_face = rho_muscl[i]
+                    u_face   = u_muscl[i]
+
+                elif 'SDCU61' in scheme:
+                    # Use MUSCL reconstruction for SDCU61 in the faucet model
                     rho_face = rho_muscl[i]
                     u_face   = u_muscl[i]
 
@@ -570,7 +575,9 @@ def vanleer_slope(dL, dR, eps=1e-30):
 # ============================================================
 class TFMShockTubeSolver:
     def __init__(self, N=200, L=100.0, t_final=0.1, sigma=1.2,
-                 scheme="PCU", dt_mode="fixed_dxdt", dxdt=1000.0, CFL=0.25):
+                 scheme="PCU", dt_mode="fixed_dxdt", dxdt=1000.0, CFL=0.25,
+                 bc_left="extrapolate", bc_right="extrapolate", p_left=1.0e5, p_right=1.0e5,
+                 gx_profile=None, Cf=0.0):
         self.N = int(N)
         self.L = float(L)
         self.dx = self.L / self.N
@@ -583,6 +590,28 @@ class TFMShockTubeSolver:
         self.dt_mode = str(dt_mode).strip().lower()
         self.dxdt = float(dxdt)
         self.CFL = float(CFL)
+
+        # Boundary conditions (ghost cell approach in primitive variables)
+        self.bc_left = str(bc_left).strip().lower()
+        self.bc_right = str(bc_right).strip().lower()
+        self.p_left = float(p_left)
+        self.p_right = float(p_right)
+
+        # Source terms: gravity component along x and interfacial drag
+        self.Cf = float(Cf)
+        if gx_profile is None:
+            self.gx_cell = np.zeros(self.N, dtype=float)
+        elif callable(gx_profile):
+            self.gx_cell = np.array([float(gx_profile(x)) for x in self.x], dtype=float)
+        else:
+            # scalar or array-like
+            gx_arr = np.array(gx_profile, dtype=float)
+            if gx_arr.size == 1:
+                self.gx_cell = np.full(self.N, float(gx_arr.item()), dtype=float)
+            elif gx_arr.size == self.N:
+                self.gx_cell = gx_arr.copy()
+            else:
+                raise ValueError('gx_profile must be None, callable, scalar, or length-N array')
 
         # EOS params (Evje & Flåtten 2005)
         self.p0 = 1.0e5
@@ -670,14 +699,47 @@ class TFMShockTubeSolver:
         p, ag, al, vg, vl, rg, rl = self.prim_from_U(Uj)
         return max(abs(vg) + self.a_g, abs(vl) + self.a_l)
 
-    # ---------- BC ----------
-    def extend_extrapolate(self, A):
-        # A: (N, m) -> (N+2, m)
-        AE = np.empty((self.N+2, A.shape[1]), dtype=float)
-        AE[1:-1] = A
-        AE[0] = A[0]
-        AE[-1] = A[-1]
-        return AE
+
+    # ---------- BC (ghost cells in primitive variables, cf. Paillère et al.) ----------
+    def extend_with_bc(self, U):
+        """
+        Build ghost cells using primitive-variable boundary conditions.
+
+        bc types:
+          - 'extrapolate' : copy boundary cell (Neumann)
+          - 'wall'        : reflect both phase velocities, keep (p, alpha_l)
+          - 'pressure'    : impose pressure p_left/p_right, extrapolate (alpha_l, v_g, v_l)
+
+        Returns UE of shape (N+2,4).
+        """
+        UE = np.empty((self.N+2, 4), dtype=float)
+        UE[1:-1] = U
+
+        # Left ghost
+        if self.bc_left == 'extrapolate':
+            UE[0] = U[0]
+        else:
+            p, ag, al, vg, vl, *_ = self.prim_from_U(U[0])
+            if self.bc_left == 'wall':
+                UE[0] = self.U_from_prim(p, al, -vg, -vl)
+            elif self.bc_left == 'pressure':
+                UE[0] = self.U_from_prim(self.p_left, al, vg, vl)
+            else:
+                raise ValueError(f'Unknown bc_left={self.bc_left}')
+
+        # Right ghost
+        if self.bc_right == 'extrapolate':
+            UE[-1] = U[-1]
+        else:
+            p, ag, al, vg, vl, *_ = self.prim_from_U(U[-1])
+            if self.bc_right == 'wall':
+                UE[-1] = self.U_from_prim(p, al, -vg, -vl)
+            elif self.bc_right == 'pressure':
+                UE[-1] = self.U_from_prim(self.p_right, al, vg, vl)
+            else:
+                raise ValueError(f'Unknown bc_right={self.bc_right}')
+
+        return UE
 
     # ---------- Flux & PCU jump ----------
     def flux_conservative(self, U):
@@ -897,7 +959,7 @@ class TFMShockTubeSolver:
 
     # ---------- One step ----------
     def step(self, dt):
-        UE = self.extend_extrapolate(self.U)
+        UE = self.extend_with_bc(self.U)
 
         scheme = self.scheme.strip()
         schemeU = scheme.upper()
@@ -962,6 +1024,23 @@ class TFMShockTubeSolver:
                 ml = self.m_floor
                 Il = ml * vl
             Unew[j] = [mg, ml, Ig, Il]
+
+
+        # ---------- Source terms (gravity/drag) ----------
+        if np.any(self.gx_cell != 0.0) or self.Cf != 0.0:
+            for j in range(self.N):
+                mg, ml, Ig, Il = Unew[j]
+                # primitives based on updated state (1st-order explicit splitting)
+                p, ag, al, vg, vl, rg, rl = self.prim_from_U(Unew[j])
+                gx = self.gx_cell[j]
+                # Interfacial drag (Paillère et al.): relax relative velocity
+                # Use rho_g scaling as in the paper; sign chosen so drag opposes (vg - vl).
+                drag_g = -self.Cf * ag * al * rg * (vg - vl)
+                drag_l = -drag_g
+                Ig += dt * (mg * gx + drag_g)
+                Il += dt * (ml * gx + drag_l)
+                Unew[j, 2] = Ig
+                Unew[j, 3] = Il
 
         self.U = Unew
 
@@ -1041,26 +1120,36 @@ class TFMShockTubeSolver:
 # ============================================================
 # Combined driver: Faucet demo OR Evje & Flåtten (2005) shock tubes
 # ============================================================
+
+# ============================================================
+# Combined driver: Faucet demo OR Evje & Flåtten (2005) shock tubes
+# Supports multi-scheme overlay plots via comma-separated --scheme list.
+# ============================================================
 if __name__ == "__main__":
     import argparse
 
+    def parse_schemes(s: str):
+        if s is None:
+            return []
+        # Allow comma/semicolon separation
+        parts = [p.strip() for p in s.replace(";", ",").split(",")]
+        return [p for p in parts if p]
+
     parser = argparse.ArgumentParser(
-        description="Run either the original faucet demo or Evje & Flåtten (2005) shock-tube benchmarks."
+        description="Run either the faucet demo or Evje & Flåtten (2005) shock-tube benchmarks."
     )
-    parser.add_argument("--problem", choices=["faucet", "LRV", "MLRV", "TOUMI"], default="LRV",
+    parser.add_argument("--problem", choices=["faucet", "LRV", "MLRV", "TOUMI", "PHASESEP", "MANOMETER"], default="LRV",
                         help="Select which problem to run.")
     parser.add_argument("--scheme", default="PCU",
-                        help=("Scheme/flux option. Faucet solver uses e.g. Upwind1, Central, MUSCL, QUICK, "
-                              "ENO2, WENO3, CWENO3, KU, PCU, Central_EVM, MUSCL_EVM. "
-                              "Shock-tube solver uses e.g. upwind1, Central, MUSCL, QUICK, NT, ENO2, "
-                              "WENO3, CWENO3, KU, SDCU61, PCU."))
-    # Common plotting toggle
+                        help=("One scheme or a comma-separated list of schemes.\n"
+                              "Faucet: Upwind1, Central, MUSCL, QUICK, ENO, WENO, CWENO, NT, KU, PCU, Central_EVM, MUSCL_EVM.\n"
+                              "Shock tubes: upwind1, Central, MUSCL, QUICK, NT, ENO2, WENO3, CWENO3, KU, SDCU61, PCU."))
     parser.add_argument("--no_plot", action="store_true")
 
     # Faucet options
-    parser.add_argument("--N_faucet", type=int, default=100)
+    parser.add_argument("--N_faucet", type=int, default=50)
     parser.add_argument("--L_faucet", type=float, default=12.0)
-    parser.add_argument("--t_final_faucet", type=float, default=0.5)
+    parser.add_argument("--t_final_faucet", type=float, default=0.6)
 
     # Shock-tube options
     parser.add_argument("--N", type=int, default=None, help="Override number of shock-tube cells.")
@@ -1069,42 +1158,82 @@ if __name__ == "__main__":
     parser.add_argument("--dt_mode", choices=["fixed_dxdt", "cfl"], default="fixed_dxdt")
     parser.add_argument("--dxdt", type=float, default=None, help="Override Δx/Δt when dt_mode=fixed_dxdt.")
     parser.add_argument("--CFL", type=float, default=0.25)
+    parser.add_argument("--sigma", type=float, default=1.2)
+    parser.add_argument("--save", default=None,
+                        help="Save plot to this path (e.g., out_plots/faucet_overlay.png).")
 
     args = parser.parse_args()
+    schemes = parse_schemes(args.scheme)
+    if not schemes:
+        raise SystemExit("No scheme(s) provided. Use --scheme PCU or --scheme PCU,KU,...")
 
     if args.problem == "faucet":
+        # ---------------------------
+        # Faucet (single-equation demo)
+        # ---------------------------
+        results = {}
         solver = FullPressureTwoFluidSolver(n_cells=args.N_faucet, L=args.L_faucet, t_final=args.t_final_faucet)
-        print(f"[Faucet] scheme={args.scheme}")
-        alpha, u_l, visc = solver.solve(scheme=args.scheme)
+        x_ref, alpha_ref = solver.analytical_solution(args.t_final_faucet)
+
+        for sch in schemes:
+            print(f"[Faucet] running scheme={sch}")
+            x, alpha, visc = solver.solve(scheme=sch)
+            results[sch] = {"x": x, "alpha": alpha, "visc": visc}
 
         if not args.no_plot:
-            fig, ax = plt.subplots(1, 1, figsize=(7, 4), constrained_layout=True)
-            ax.plot(solver.x, alpha)
-            ax.set_title(f"Faucet: alpha(x) | scheme={args.scheme}")
-            ax.set_xlabel("x"); ax.set_ylabel("alpha")
+            fig, ax = plt.subplots(1, 1, figsize=(8, 4.5), constrained_layout=True)
+            ax.plot(x_ref, alpha_ref, "k--", linewidth=2.0, label=f"Analytical (t={args.t_final_faucet:g}s)")
+            for sch in schemes:
+                ax.plot(results[sch]["x"], results[sch]["alpha"], linewidth=1.8, label=sch)
+            ax.set_title("Water faucet: void fraction comparison")
+            ax.set_xlabel("x (m)")
+            ax.set_ylabel("alpha_g (void fraction)")
             ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=9)
             plt.show()
 
     else:
-        # --- Evje & Flåtten (2005) shock-tube benchmarks ---
+        # ---------------------------
+        # Evje & Flåtten (2005) shock-tube benchmarks
+        # ---------------------------
         CASES = {
             "LRV": {
                 "title": "LRV shock (Evje & Flåtten 2005 §7.1)",
+                "init_type": "shocktube",
                 "WL": {"p": 265000.0, "alpha_l": 0.71, "vg": 65.0, "vl": 1.0},
                 "WR": {"p": 265000.0, "alpha_l": 0.70, "vg": 50.0, "vl": 1.0},
                 "N": 100, "L": 100.0, "t_final": 0.1, "dxdt": 1000.0, "sigma": 1.2,
             },
             "MLRV": {
                 "title": "Modified LRV shock (Evje & Flåtten 2005 §7.2)",
+                "init_type": "shocktube",
                 "WL": {"p": 265000.0, "alpha_l": 0.70, "vg": 65.0, "vl": 10.0},
                 "WR": {"p": 265000.0, "alpha_l": 0.10, "vg": 50.0, "vl": 15.0},
                 "N": 100, "L": 100.0, "t_final": 0.1, "dxdt": 750.0, "sigma": 1.2,
             },
             "TOUMI": {
                 "title": "Toumi water-air shock (Evje & Flåtten 2005 §7.3)",
+                "init_type": "shocktube",
                 "WL": {"p": 2.0e7, "alpha_l": 0.75, "vg": 0.0, "vl": 0.0},
                 "WR": {"p": 1.0e7, "alpha_l": 0.90, "vg": 0.0, "vl": 0.0},
                 "N": 200, "L": 100.0, "t_final": 0.08, "dxdt": 1000.0, "sigma": 2.0,
+            },
+            "PHASESEP": {
+                "title": "Phase separation (Paillère et al. 2003 §4.4)",
+                "init_type": "uniform",
+                "init": {"p": 1.0e5, "alpha_l": 0.5, "vg": 0.0, "vl": 0.0},
+                "N": 50, "L": 7.5, "t_final": 0.1, "dxdt": 1000.0, "sigma": 0.0, # t_final=2.0 for better visualization
+                "bc_left": "wall", "bc_right": "wall",
+                "p_left": 1.0e5, "p_right": 1.0e5,
+                "gx_kind": "constant", "Cf": 0.0,
+            },
+            "MANOMETER": {
+                "title": "Oscillating manometer (Paillère et al. 2003 §4.5)",
+                "init_type": "manometer",
+                "N": 220, "L": 20.0, "t_final": 2.0, "dxdt": 1000.0, "sigma": 0.0,
+                "bc_left": "pressure", "bc_right": "pressure",
+                "p_left": 1.0e5, "p_right": 1.0e5,
+                "gx_kind": "manometer", "Cf": 5.0e-4,
             },
         }
         cfg = CASES[args.problem]
@@ -1115,29 +1244,118 @@ if __name__ == "__main__":
         dxdt = args.dxdt if args.dxdt is not None else cfg["dxdt"]
         sigma = cfg["sigma"]
 
-        solver = TFMShockTubeSolver(
-            N=N, L=L, t_final=t_final,
-            sigma=sigma,
-            scheme=args.scheme,
-            dt_mode=args.dt_mode,
-            dxdt=dxdt,
-            CFL=args.CFL,
-        )
+        # Gravity profile (Paillère cases)
+        gx_kind = cfg.get("gx_kind", None)
+        if gx_kind is None:
+            gx_profile = None
+        elif gx_kind == "constant":
+            gx_profile = 9.81
+        elif gx_kind == "manometer":
+            # gx(x) as in Paillère et al. (U-tube parametrization)
+            def gx_profile(x):
+                if x < 5.0:
+                    return 9.81
+                if x <= 15.0:
+                    return 9.81 * math.cos((x - 5.0) * math.pi / 10.0)
+                return -9.81
+        else:
+            raise ValueError(f"Unknown gx_kind={gx_kind}")
 
-        WL = cfg["WL"]; WR = cfg["WR"]
-        x0 = 0.5 * L
-        for j, x in enumerate(solver.x):
-            W = WL if x < x0 else WR
-            solver.U[j] = solver.U_from_prim(W["p"], W["alpha_l"], W["vg"], W["vl"])
+        bc_left = cfg.get("bc_left", "extrapolate")
+        bc_right = cfg.get("bc_right", "extrapolate")
+        p_left = cfg.get("p_left", 1.0e5)
+        p_right = cfg.get("p_right", 1.0e5)
+        Cf = cfg.get("Cf", 0.0)
 
-        print(f"[ShockTube {args.problem}] scheme={args.scheme} | dt_mode={args.dt_mode} | "
-              f"{('dx/dt='+str(dxdt)) if args.dt_mode=='fixed_dxdt' else ('CFL='+str(args.CFL))} | sigma={sigma}")
+        results = {}
 
-        solver.run()
+        def run_one(sch: str):
+            solver = TFMShockTubeSolver(
+                N=N, L=L, t_final=t_final,
+                sigma=sigma,
+                scheme=sch,
+                dt_mode=args.dt_mode,
+                dxdt=dxdt,
+                CFL=args.CFL,
+                bc_left=bc_left, bc_right=bc_right,
+                p_left=p_left, p_right=p_right,
+                gx_profile=gx_profile,
+                Cf=Cf,
+            )
+
+            init_type = cfg.get("init_type", "shocktube")
+            if init_type == "shocktube":
+                WL = cfg["WL"]; WR = cfg["WR"]
+                x0 = 0.5 * L
+                for j, x in enumerate(solver.x):
+                    W = WL if x < x0 else WR
+                    solver.U[j] = solver.U_from_prim(W["p"], W["alpha_l"], W["vg"], W["vl"])
+            elif init_type == "uniform":
+                W0 = cfg["init"]
+                for j in range(solver.N):
+                    solver.U[j] = solver.U_from_prim(W0["p"], W0["alpha_l"], W0["vg"], W0["vl"])
+            elif init_type == "manometer":
+                # V(x,0) in Paillère et al.: V = (alpha_g, u_g, u_l, p)
+                # Convert to our alpha_l = 1 - alpha_g
+                rho_l0 = solver.rho_l0
+                g = 9.81
+                Lcol = 10.0
+                V0 = 2.1
+                for j, x in enumerate(solver.x):
+                    if x < 5.0 or x > 15.0:
+                        alpha_g = 0.999
+                        p = 1.0e5
+                    else:
+                        alpha_g = 0.001
+                        p = 1.0e5 + rho_l0 * g * Lcol / math.pi * math.sin(math.pi * (x - 5.0) / Lcol)
+                    alpha_l = 1.0 - alpha_g
+                    solver.U[j] = solver.U_from_prim(p, alpha_l, V0, V0)
+            else:
+                raise ValueError(f"Unknown init_type={init_type}")
+
+            print(f"[Case {args.problem}] running scheme={sch} | dt_mode={args.dt_mode} | "
+                  f"{('dx/dt='+str(dxdt)) if args.dt_mode=='fixed_dxdt' else ('CFL='+str(args.CFL))} | sigma={sigma} | Cf={Cf} | bc=({bc_left},{bc_right})")
+            solver.run()
+            p, al, vg, vl = solver.get_primitives()
+            results[sch] = {"x": solver.x.copy(), "p": p, "al": al, "vg": vg, "vl": vl}
+
+        for sch in schemes:
+            run_one(sch)
 
         if not args.no_plot:
-            title = f'{cfg["title"]} | scheme={args.scheme} | dt_mode={args.dt_mode}'
-            if args.dt_mode == "fixed_dxdt":
-                title += f" | dx/dt={dxdt:g}"
-            fig = solver.plot(title=title)
+            fig, axs = plt.subplots(2, 2, figsize=(11, 7.5), constrained_layout=True)
+
+            # alpha_l
+            for sch in schemes:
+                axs[0,0].plot(results[sch]["x"], results[sch]["al"], linewidth=1.6, label=sch)
+            axs[0,0].set_title("Liquid fraction α_l")
+            axs[0,0].set_xlabel("x"); axs[0,0].set_ylabel("α_l")
+            axs[0,0].grid(True, alpha=0.3)
+
+            # p
+            for sch in schemes:
+                axs[0,1].plot(results[sch]["x"], results[sch]["p"], linewidth=1.6, label=sch)
+            axs[0,1].set_title("Pressure p (Pa)")
+            axs[0,1].set_xlabel("x"); axs[0,1].set_ylabel("p")
+            axs[0,1].grid(True, alpha=0.3)
+
+            # v_l
+            for sch in schemes:
+                axs[1,0].plot(results[sch]["x"], results[sch]["vl"], linewidth=1.6, label=sch)
+            axs[1,0].set_title("Liquid velocity v_l (m/s)")
+            axs[1,0].set_xlabel("x"); axs[1,0].set_ylabel("v_l")
+            axs[1,0].grid(True, alpha=0.3)
+
+            # v_g
+            for sch in schemes:
+                axs[1,1].plot(results[sch]["x"], results[sch]["vg"], linewidth=1.6, label=sch)
+            axs[1,1].set_title("Gas velocity v_g (m/s)")
+            axs[1,1].set_xlabel("x"); axs[1,1].set_ylabel("v_g")
+            axs[1,1].grid(True, alpha=0.3)
+
+            # One shared legend
+            handles, labels = axs[0,0].get_legend_handles_labels()
+            fig.legend(handles, labels, loc="upper center", ncols=min(len(labels), 5), fontsize=9)
+
+            fig.suptitle(f'{cfg["title"]} | dt_mode={args.dt_mode}')
             plt.show()
